@@ -1,0 +1,459 @@
+# tcl-polycall real-core tests (tcltest). Run through tests/run-real-core.sh,
+# which builds and installs the extension, starts a `polycall start` runtime
+# and exports POLYCALL_* test variables. Without them every test is SKIPPED.
+
+package require tcltest 2.5
+namespace import ::tcltest::*
+
+set ::pc_version [package require tcl-polycall]
+set ::pc_load [package ifneeded tcl-polycall $::pc_version]
+
+testConstraint realcore [expr {[info exists ::env(POLYCALL_TEST_RPC_ENDPOINT)] && [info exists ::env(POLYCALL_CLI)]}]
+testConstraint threads [expr {![catch {package require Thread 3}]}]
+testConstraint norpath [expr {[info exists ::env(TCL_POLYCALL_NORPATH_EXT)] && [file exists $::env(TCL_POLYCALL_NORPATH_EXT)]}]
+
+proc tmp {name} { file join $::env(POLYCALL_TEST_TMP) $name }
+proc write {name text} {
+    set f [open [tmp $name] w]; puts -nonewline $f $text; close $f
+    return [tmp $name]
+}
+# Status of a failing script: lindex 2 of -errorcode {POLYCALL NAME CODE DETAIL ?EXTRA?}
+proc status_of {script} {
+    if {![catch {uplevel 1 $script} msg opts]} { return "OK (no error)" }
+    set ec [dict get $opts -errorcode]
+    if {[lindex $ec 0] ne "POLYCALL"} { return "non-polycall error: $msg ($ec)" }
+    return [lindex $ec 2]
+}
+proc errorcode_of {script} {
+    catch {uplevel 1 $script} msg opts
+    return [dict get $opts -errorcode]
+}
+proc all_bytes {} {
+    set s ""
+    for {set i 0} {$i < 256} {incr i} { append s [binary format c $i] }
+    return $s
+}
+proc utf8 {s} { encoding convertto utf-8 $s }
+# recv one message and return {sender message_id payload}
+proc take {h {timeout 3000}} {
+    set m [polycall::peer recv $h $timeout]
+    list [dict get $m sender] [dict get $m message_id] [dict get $m payload]
+}
+proc child_tcl {env script} {
+    # run SCRIPT (as a file, so an error exits non-zero) in a fresh tclsh
+    # with ENV (dict) added; returns {exitcode output}
+    set file [tmp child-[clock microseconds].tcl]
+    set f [open $file w]; puts $f $script; close $f
+    # env(1) sets the child's environment; this interpreter's ::env is untouched
+    set assignments {}
+    foreach {k v} $env { lappend assignments "$k=$v" }
+    set rc [catch {exec env {*}$assignments [info nameofexecutable] $file 2>@1} out opts]
+    set code 0
+    if {$rc} { set code [lindex [dict get $opts -errorcode] 2] }
+    list $code $out
+}
+
+# ---- library ----------------------------------------------------------------
+
+test library-1 {version and ABI check} realcore {
+    list [polycall::abi_version] [regexp {^1\.[1-9][0-9]*\.[0-9]+$} [polycall::version]] $::pc_version
+} {1 1 1.1.0}
+
+test library-2 {polycall_strerror names every status} realcore {
+    set names {}
+    for {set s 0} {$s >= -18} {incr s -1} {
+        lappend names [lindex [split [polycall::strerror $s] :] 0]
+    }
+    list [lindex $names 0] [lindex $names 4] [lindex $names 18] [llength [lsort -unique $names]] \
+        [string match POLYCALL_E_UNKNOWN* [polycall::strerror -999]]
+} {POLYCALL_OK POLYCALL_E_TIMEOUT POLYCALL_E_INTERNAL 19 1}
+
+test library-3 {errors carry status, name and polycall_last_error detail} realcore {
+    set ec [errorcode_of {polycall::peer endpoint 987654}]
+    list [lindex $ec 1] [lindex $ec 2] [string match *handle* [lindex $ec 3]] \
+        [polycall::run_config] [polycall::last_error]
+} {POLYCALL_E_INVALID_HANDLE -3 1 0 {}}
+
+test library-4 {missing libpolycall: load fails with a clear error} {realcore norpath} {
+    lassign [child_tcl [list LD_LIBRARY_PATH /nonexistent] \
+        "load [list $::env(TCL_POLYCALL_NORPATH_EXT)] Tclpolycall"] code out
+    list [expr {$code != 0}] [string match "*libpolycall.so.1*" $out]
+} {1 1}
+
+test library-5 {old core without ABI v1 symbols: load fails naming the symbol} realcore {
+    lassign [child_tcl [list LD_LIBRARY_PATH [file dirname $::env(POLYCALL_TEST_FAKE_OLD)]] \
+        "package require tcl-polycall"] code out
+    list [expr {$code != 0}] [string match "*undefined symbol: polycall_*" $out]
+} {1 1}
+
+test library-6 {ABI mismatch: Init refuses the library} realcore {
+    lassign [child_tcl [list LD_LIBRARY_PATH [file dirname $::env(POLYCALL_TEST_FAKE_ABI2)]] \
+        {if {[catch {package require tcl-polycall} m o]} { puts "$m | [dict get $o -errorcode]"; exit 3 }}] code out
+    list $code [string match "*reports binding ABI 2*POLYCALL_E_UNSUPPORTED*" $out]
+} {3 1}
+
+# ---- configuration -------------------------------------------------------------
+
+test config-1 {shipped rc files validate strictly; describe} realcore {
+    list [polycall::run_config [file join $::env(TCL_POLYCALL_REPO) tcl-polycallrc]] \
+        [polycall::run_config [file join $::env(TCL_POLYCALL_REPO) examples tcl-polycallrc] 1] \
+        [polycall::run_config_or_error [file join $::env(TCL_POLYCALL_REPO) tcl-polycallrc]] \
+        [string match {*"layer"*} [polycall::describe [file join $::env(TCL_POLYCALL_REPO) tcl-polycallrc]]]
+} {0 0 0 1}
+
+test config-2 {missing and empty paths} realcore {
+    list [polycall::run_config [tmp missing-polycallrc]] [polycall::run_config ""] \
+        [status_of {polycall::run_config_or_error /nonexistent/tcl-polycallrc}]
+} {-7 -1 -7}
+
+test config-3 {invalid value: E_CONFIG naming the key} realcore {
+    set p [write bad-polycallrc "max_connections=lots\n"]
+    set st [polycall::run_config $p 0]
+    set detail [polycall::last_error]
+    set ec [errorcode_of {polycall::run_config_or_error $p}]
+    list $st [string match *max_connections* $detail] [lindex $ec 1] [string match *max_connections* [lindex $ec 3]]
+} {-13 1 POLYCALL_E_CONFIG 1}
+
+test config-4 {unknown key: warning unless strict (default strict)} realcore {
+    set p [write unknown-polycallrc "log_level=info\nmystery_key=1\n"]
+    list [polycall::run_config $p 0] [polycall::run_config $p 1] [polycall::run_config $p]
+} {0 -13 -13}
+
+test config-5 {tls_enabled=true: refused, not faked, when strict} realcore {
+    set p [write tls-polycallrc "tls_enabled=true\ncert_file=/x/c.pem\nkey_file=/x/k.pem\n"]
+    list [polycall::run_config $p 0] [polycall::run_config $p 1] [string match -nocase *tls* [polycall::last_error]]
+} {0 -15 1}
+
+# ---- polycall_call -----------------------------------------------------------------
+
+test call-1 {success} realcore {
+    set ep $::env(POLYCALL_TEST_RPC_ENDPOINT)
+    list [polycall::call $ep inventory get {{"item_id":"widget-a"}} 2000] \
+        [polycall::call $ep debug echo "" 2000] \
+        [polycall::call $ep debug echo "{\"s\":\"h\u00e9 \U1F30D\"}" 2000]
+} [list {{"item_id":"widget-a","quantity":42,"in_stock":true}} {{"echo":null}} "{\"echo\":{\"s\":\"h\u00e9 \U1F30D\"}}"]
+
+test call-2 {unknown operation} realcore {
+    status_of {polycall::call $::env(POLYCALL_TEST_RPC_ENDPOINT) inventory teleport {{}} 2000}
+} -7
+
+test call-3 {remote error carries the error object} realcore {
+    set ec [errorcode_of {polycall::call $::env(POLYCALL_TEST_RPC_ENDPOINT) inventory get {{"item_id":"nope"}} 2000}]
+    list [lindex $ec 2] [string match *item.unknown* [lindex $ec 4]]
+} {-9 1}
+
+test call-4 {deadline exceeded} realcore {
+    set t0 [clock milliseconds]
+    set st [status_of {polycall::call $::env(POLYCALL_TEST_RPC_ENDPOINT) debug sleep {{"ms":2000}} 150}]
+    list $st [expr {[clock milliseconds] - $t0 < 1900}]
+} {-4 1}
+
+test call-5 {invalid input} realcore {
+    set ep $::env(POLYCALL_TEST_RPC_ENDPOINT)
+    set bad "\{not json"
+    list [status_of {polycall::call $ep debug echo $bad 1000}] \
+        [status_of {polycall::call $ep debug echo "{}" 0}] \
+        [status_of {polycall::call no-port debug echo "" 1000}]
+} {-1 -1 -1}
+
+test call-6 {no runtime} realcore {
+    status_of {polycall::call 127.0.0.1:1 inventory get {{}} 1000}
+} -5
+
+# ---- peers -------------------------------------------------------------------------
+
+test peer-1 {identity, endpoint and send-only node} realcore {
+    set a [polycall::peer open alpha]
+    set s [polycall::peer open sender-only ""]
+    set r [list [expr {$a > 0}] [polycall::peer node_id $a] \
+        [regexp {^127\.0\.0\.1:[1-9][0-9]*$} [polycall::peer endpoint $a]] \
+        [polycall::peer endpoint $s] [expr {$a != $s}] \
+        [string match {*"node_id":"alpha"*} [polycall::peer health $a]]]
+    polycall::peer close $a; polycall::peer close $s
+    set r
+} {1 alpha 1 {} 1 1}
+
+test peer-2 {payloads both directions; sender and message id verified} realcore {
+    set a [polycall::peer open alpha]; set b [polycall::peer open beta]
+    polycall::peer register $a beta [polycall::peer endpoint $b]
+    polycall::peer register $b alpha [polycall::peer endpoint $a]
+    polycall::peer send $a beta "hello beta" a2b-1
+    set r1 [take $b]
+    polycall::peer send $b alpha "hello alpha" b2a-1
+    set r2 [take $a]
+    polycall::peer ping $a beta
+    polycall::peer ping $b [polycall::peer endpoint $a]
+    polycall::peer close $a; polycall::peer close $b
+    list $r1 $r2
+} {{alpha a2b-1 {hello beta}} {beta b2a-1 {hello alpha}}}
+
+test peer-3 {payload matrix: empty, UTF-8, binary+NUL, 1 MiB, 1 MiB + 1} realcore {
+    set a [polycall::peer open alpha]; set b [polycall::peer open beta]
+    polycall::peer register $a beta [polycall::peer endpoint $b]
+    set r {}
+    polycall::peer send $a beta "" empty-1
+    lappend r [take $b]
+    set u [utf8 "h\u00e9llo \u2014 \u4e16\u754c \U1F30D"]
+    polycall::peer send $a beta $u utf8-1
+    lassign [take $b] f id p
+    lappend r [list $f $id [expr {$p eq $u}] [string length $p] [encoding convertfrom utf-8 $p]]
+    set bin "[all_bytes]\x00\x00tail\x00"
+    polycall::peer send $a beta $bin binary-1
+    lassign [take $b] f id p
+    lappend r [list $f $id [expr {$p eq $bin}] [string length $p]]
+    set max [string repeat [all_bytes] 4096]
+    polycall::peer send $a beta $max max-1 10000
+    lassign [take $b 5000] f id p
+    lappend r [list $id [string length $p] [expr {$p eq $max}]]
+    lappend r [status_of {polycall::peer send $a beta "${max}x" over-1}]
+    lappend r [status_of {polycall::peer recv $b 200}]
+    polycall::peer close $a; polycall::peer close $b
+    set r
+} [list {alpha empty-1 {}} [list alpha utf8-1 1 22 "h\u00e9llo \u2014 \u4e16\u754c \U1F30D"] \
+       {alpha binary-1 1 263} {max-1 1048576 1} -10 -4]
+
+test peer-4 {registry belongs to its node only} realcore {
+    set a [polycall::peer open alpha]; set b [polycall::peer open beta]
+    set r [list [polycall::peer list $a]]
+    polycall::peer register $a beta [polycall::peer endpoint $b]
+    lappend r [expr {[polycall::peer list $a] eq [list beta [polycall::peer endpoint $b]]}]
+    lappend r [polycall::peer list $b] [polycall::peer list_json $b]
+    polycall::peer send $a beta x own-1
+    lappend r [lindex [take $b] 0] [polycall::peer list $b]
+    lappend r [status_of {polycall::peer send $b alpha x}]
+    polycall::peer unregister $a beta
+    lappend r [polycall::peer list $a] [status_of {polycall::peer unregister $a beta}]
+    lappend r [status_of {polycall::peer register $a "bad id!" [polycall::peer endpoint $b]}]
+    polycall::peer close $a; polycall::peer close $b
+    set r
+} {{} 1 {} {{}} alpha {} -7 {} -7 -1}
+
+test peer-5 {duplicate message id delivered once} realcore {
+    set a [polycall::peer open alpha]; set b [polycall::peer open beta]
+    polycall::peer register $a beta [polycall::peer endpoint $b]
+    polycall::peer send $a beta once dup-1
+    polycall::peer send $a beta once dup-1
+    set r [list [take $b] [status_of {polycall::peer recv $b 300}] \
+        [string match {*"duplicates":1*} [polycall::peer health $b]]]
+    polycall::peer close $a; polycall::peer close $b
+    set r
+} {{alpha dup-1 once} -4 1}
+
+test peer-6 {auth failure rejected, nothing queued} realcore {
+    set tok $::env(POLYCALL_DEV_TOKEN)
+    set b [polycall::peer open beta 127.0.0.1:0 $tok]
+    set c [polycall::peer open carol ""]
+    set m [polycall::peer open mallory "" not-the-token]
+    set g [polycall::peer open alpha "" $tok]
+    set ep [polycall::peer endpoint $b]
+    set r [list [status_of {polycall::peer send $c $ep x auth-1}] [status_of {polycall::peer send $m $ep x auth-2}] \
+        [status_of {polycall::peer recv $b 200}]]
+    polycall::peer send $g $ep ok auth-3
+    lappend r [take $b]
+    foreach h [list $b $c $m $g] { polycall::peer close $h }
+    set r
+} {-8 -8 -4 {alpha auth-3 ok}}
+
+test peer-7 {send to a dead peer: E_TRANSPORT} realcore {
+    set a [polycall::peer open alpha]
+    set d [polycall::peer open doomed]
+    set ep [polycall::peer endpoint $d]
+    polycall::peer close $d
+    polycall::peer register $a doomed $ep
+    set r [list [status_of {polycall::peer send $a doomed "into the void" dead-1 2000}] \
+        [status_of {polycall::peer ping $a $ep 1000}]]
+    polycall::peer close $a
+    set r
+} {-5 -5}
+
+test peer-8 {receive timeout and poll} realcore {
+    set b [polycall::peer open beta]
+    set t0 [clock milliseconds]
+    set st [status_of {polycall::peer recv $b 150}]
+    set dt [expr {[clock milliseconds] - $t0}]
+    set r [list $st [expr {$dt >= 100 && $dt < 3000}] [status_of {polycall::peer recv $b 0}]]
+    polycall::peer close $b
+    set r
+} {-4 1 -4}
+
+test peer-9 {too-small buffer leaves the message queued} realcore {
+    set a [polycall::peer open alpha]; set b [polycall::peer open beta]
+    polycall::peer send $a [polycall::peer endpoint $b] 0123456789 size-1
+    set ec [errorcode_of {polycall::peer recv $b 2000 4}]
+    set r [list [lindex $ec 2] [lindex $ec 4] [take $b]]
+    polycall::peer close $a; polycall::peer close $b
+    set r
+} {-10 10 {alpha size-1 0123456789}}
+
+# blocking recv in a worker thread; returns the thread id and the result var
+proc blocked_recv {h var} {
+    set tid [thread::create]
+    thread::send $tid $::pc_load
+    thread::send -async $tid [list catch [list polycall::peer recv $h forever] msg] $var
+    return $tid
+}
+
+test peer-10 {cancel wakes a blocked receive (other thread)} {realcore threads} {
+    set b [polycall::peer open beta]
+    set ::cancel_rc pending
+    set tid [blocked_recv $b ::cancel_rc]
+    after 300
+    update
+    set before $::cancel_rc
+    polycall::peer cancel $b
+    set timer [after 5000 {set ::cancel_rc timeout}]
+    vwait ::cancel_rc
+    after cancel $timer
+    set ec [thread::send $tid {set ::errorCode}]
+    set later [status_of {polycall::peer recv $b 100}]
+    thread::release $tid
+    polycall::peer close $b
+    list $before $::cancel_rc [lindex $ec 1] $later
+} {pending 1 POLYCALL_E_CANCELLED -4}
+
+test peer-11 {close wakes every blocked receive (other threads)} {realcore threads} {
+    set b [polycall::peer open beta]
+    set tids {}
+    foreach i {0 1 2} {
+        set ::close_rc($i) pending
+        lappend tids [blocked_recv $b ::close_rc($i)]
+    }
+    after 300
+    polycall::peer close $b
+    set timer [after 5000 {set ::close_rc(timeout) 1}]
+    foreach i {0 1 2} { if {$::close_rc($i) eq "pending"} { vwait ::close_rc($i) } }
+    after cancel $timer
+    set codes {}
+    foreach tid $tids { lappend codes [lindex [thread::send $tid {set ::errorCode}] 1]; thread::release $tid }
+    list $::close_rc(0) $::close_rc(1) $::close_rc(2) $codes
+} {1 1 1 {POLYCALL_E_CLOSED POLYCALL_E_CLOSED POLYCALL_E_CLOSED}}
+
+test peer-12 {double close, calls after close, invalid and stale handles} realcore {
+    set p [polycall::peer open closing]
+    polycall::peer close $p
+    set r [list [status_of {polycall::peer close $p}]]
+    foreach call [list "endpoint $p" "node_id $p" "send $p 127.0.0.1:1 x" "recv $p 0" "cancel $p" \
+                      "list $p" "health $p" "register $p x 127.0.0.1:1" "unregister $p x" "ping $p 127.0.0.1:1"] {
+        lappend r [status_of [list polycall::peer {*}$call]]
+    }
+    foreach bogus {0 -1 999999 2147483647} { lappend r [status_of {polycall::peer ping $bogus 127.0.0.1:1}] }
+    set n [polycall::peer open closing]
+    lappend r [expr {$n != $p}] [status_of {polycall::peer endpoint $p}]
+    polycall::peer close $n
+    set r
+} {-3 -3 -3 -3 -3 -3 -3 -3 -3 -3 -3 -3 -3 -3 -3 1 -3}
+
+test peer-13 {invalid identifiers and non-loopback bind without a token} realcore {
+    set a [polycall::peer open alpha]
+    set r [list [status_of {polycall::peer open "bad id!"}] [status_of {polycall::peer open [string repeat x 64]}] \
+        [status_of {polycall::peer send $a [polycall::peer endpoint $a] x "bad id!"}] \
+        [status_of {polycall::peer open public 0.0.0.0:0}] \
+        [catch {polycall::peer send $a beta "\u4e16"}]]
+    polycall::peer close $a
+    set r
+} {-1 -1 -1 -13 1}
+
+test peer-14 {concurrent senders: shared and separate handles in 8 threads, backpressure retried} {realcore threads} {
+    set b [polycall::peer open beta]
+    set ep [polycall::peer endpoint $b]
+    set shared [polycall::peer open shared ""]
+    set per 40
+    set sender {
+        proc deliver {h ep id payload} {
+            while {[catch {polycall::peer send $h $ep $payload $id 5000} m o]} {
+                if {[lindex [dict get $o -errorcode] 1] ne "POLYCALL_E_BUSY"} { return -options $o $m }
+                incr ::busy; after 10
+            }
+        }
+        set ::busy 0
+    }
+    set tids {}
+    for {set t 0} {$t < 8} {incr t} {
+        set tid [thread::create]
+        thread::send $tid $::pc_load
+        thread::send $tid $sender
+        if {$t < 4} {
+            set script "for {set i 0} {\$i < $per} {incr i} { deliver $shared $ep shared-$t-\$i s$t:\$i }; set ::busy"
+        } else {
+            set script "set h \[polycall::peer open own$t {}\]; for {set i 0} {\$i < $per} {incr i} { deliver \$h $ep own$t-\$i o$t:\$i }; polycall::peer close \$h; set ::busy"
+        }
+        set ::done($t) pending
+        thread::send -async $tid $script ::done($t)
+        lappend tids $tid
+    }
+    set seen [dict create]
+    for {set i 0} {$i < 8 * $per} {incr i} {
+        lassign [take $b 10000] f id p
+        dict set seen $id [list $f $p]
+    }
+    foreach t {0 1 2 3 4 5 6 7} { if {$::done($t) eq "pending"} { vwait ::done($t) } }
+    foreach tid $tids { thread::release $tid }
+    set r [list [dict size $seen] [dict get $seen shared-3-39] [dict get $seen own6-7] \
+        [status_of {polycall::peer recv $b 200}]]
+    polycall::peer close $b; polycall::peer close $shared
+    set r
+} {320 {shared s3:39} {own6 o6:7} -4}
+
+# ---- interop with the C CLI peer -------------------------------------------------------
+
+proc start_cli_node {id} {
+    set file [tmp $id.[pid].ep]
+    file delete $file
+    set pid [exec $::env(POLYCALL_CLI) peer serve --node-id $id --endpoint 127.0.0.1:0 \
+                 --endpoint-file $file >& [tmp $id.[pid].log] &]
+    for {set i 0} {$i < 100} {incr i} {
+        if {[file exists $file] && [file size $file] > 0} {
+            set f [open $file]; set ep [string trim [read $f]]; close $f
+            return [list $pid $ep]
+        }
+        after 100
+    }
+    exec kill $pid
+    error "polycall peer serve did not start"
+}
+proc json_field {json key} {
+    if {[regexp "\"$key\":\"(\[^\"\]*)\"" $json -> v]} { return $v }
+    return ""
+}
+
+test interop-1 {Tcl peer <-> `polycall peer serve` C node, both directions} realcore {
+    lassign [start_cli_node cnode] cpid cep
+    set h [polycall::peer open tcl-node 127.0.0.1:0 $::env(POLYCALL_DEV_TOKEN)]
+    polycall::peer register $h cnode $cep
+    polycall::peer ping $h cnode 2000
+    set payload "tcl\x00to\xffC [all_bytes]"
+    polycall::peer send $h cnode $payload tcl-to-c-1
+    set out [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000]
+    set r [list [json_field $out from] [json_field $out id] \
+        [expr {[json_field $out payload_b64] eq [binary encode base64 $payload]}]]
+    set back "C\x00to Tcl [string reverse [all_bytes]]"
+    set f [open [tmp c-to-tcl.bin] wb]; puts -nonewline $f $back; close $f
+    exec $::env(POLYCALL_CLI) peer send --from cnode --to [polycall::peer endpoint $h] \
+        --id c-to-tcl-1 --payload-file [tmp c-to-tcl.bin]
+    lassign [take $h] f id p
+    lappend r $f $id [expr {$p eq $back}]
+    polycall::peer send $h cnode again tcl-dup-1
+    polycall::peer send $h cnode again tcl-dup-1
+    lappend r [json_field [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000] id]
+    lappend r [catch {exec $::env(POLYCALL_CLI) peer recv --to $cep -t 300} m o] \
+        [lindex [dict get $o -errorcode] 2]
+    exec kill $cpid
+    polycall::peer close $h
+    set r
+} {tcl-node tcl-to-c-1 1 cnode c-to-tcl-1 1 tcl-dup-1 1 6}
+
+test interop-2 {CLI registers on the Tcl node and reads its health} realcore {
+    set h [polycall::peer open tcl-node 127.0.0.1:0 $::env(POLYCALL_DEV_TOKEN)]
+    set ep [polycall::peer endpoint $h]
+    exec $::env(POLYCALL_CLI) peer register --to $ep --id remote-c --peer-endpoint 127.0.0.1:9
+    set r [list [polycall::peer list $h] [json_field [exec $::env(POLYCALL_CLI) peer health --to $ep] node_id]]
+    polycall::peer close $h
+    set r
+} {{remote-c 127.0.0.1:9} tcl-node}
+
+test interop-3 {call matches the CLI client} realcore {
+    set ep $::env(POLYCALL_TEST_RPC_ENDPOINT)
+    set cli [exec $::env(POLYCALL_CLI) call inventory get --endpoint $ep --input-value {{"item_id":"widget-b"}}]
+    set tcl [polycall::call $ep inventory get {{"item_id":"widget-b"}} 2000]
+    list [expr {[string first $tcl $cli] >= 0}] $tcl
+} {1 {{"item_id":"widget-b","quantity":7,"in_stock":true}}}

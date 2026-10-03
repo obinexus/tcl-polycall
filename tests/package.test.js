@@ -1,30 +1,50 @@
 'use strict';
 
+// Package-metadata test (no Tcl needed): npm, Tcl package and binding
+// manifest are consistent and every exported path exists. The extension
+// itself is tested against the real core by tests/run-real-core.sh.
+
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const binding = require('..');
 const metadata = require('../package.json');
+const manifest = require('../polycall-binding.json');
+
+const repo = 'https://github.com/obinexus/tcl-polycall';
 
 assert.equal(metadata.name, '@obinexusltd/tcl-polycall');
 assert.equal(metadata.license, 'MIT');
 assert.equal(metadata.publishConfig.access, 'public');
+assert.equal(metadata.repository.url, `git+${repo}.git`);
+assert.equal(metadata.bugs.url, `${repo}/issues`);
+assert.equal(metadata.homepage, `${repo}#readme`);
+assert.equal(manifest.version, metadata.version);
+assert.equal(manifest.core, 'polycall >= 1.1.0 (binding ABI 1)');
+assert.equal(manifest.core_repository, 'https://github.com/obinexus/polycall');
+for (const key of ['native_extension', 'config']) {
+  assert.ok(fs.existsSync(path.join(__dirname, '..', manifest[key])), `manifest ${key} exists`);
+}
 
 const author = typeof metadata.author === 'string'
   ? metadata.author
   : `${metadata.author?.name} <${metadata.author?.email}>`;
 assert.equal(author, 'Nnamdi Michael Okpala <okpalan@protonmail.com>');
 
-const metadataKeys = {
-  src: 'src',
-  include: 'include',
-  generated: 'generated',
-  dist: 'dist',
-  examples: 'example',
-  tests: 'test',
-  scripts: 'scripts'
-};
+// one version everywhere: package.json, the C extension, pkgIndex.tcl, Makefile
+const source = fs.readFileSync(binding.extensionSource, 'utf8');
+const pkgIndex = fs.readFileSync(binding.packageIndex, 'utf8');
+const makefile = fs.readFileSync(binding.makefile, 'utf8');
+assert.match(source, new RegExp(`#define TCL_POLYCALL_VERSION "${metadata.version}"`));
+assert.match(pkgIndex, new RegExp(`package ifneeded tcl-polycall ${metadata.version} `));
+assert.match(makefile, new RegExp(`^VERSION := ${metadata.version}$`, 'm'));
+assert.match(source, /#include <polycall\.h>/);
+assert.match(source, /polycall_ffi_run_config\(path, strict \? 1 : 0\)/);
+assert.match(makefile, /pkg-config|\$\(PKG_CONFIG\) --cflags polycall/);
+assert.match(makefile, /SHLIB_EXT := \.dylib/, 'macOS builds the suffix Tcl loads');
+assert.match(makefile, /PIC := -fPIC/);
 
+const metadataKeys = { src: 'src', dist: 'dist', examples: 'example', tests: 'test' };
 for (const [name, directory] of Object.entries(binding.directories)) {
   const metadataKey = metadataKeys[name];
   assert.equal(metadata.directories[metadataKey], directory.relative);
@@ -34,15 +54,17 @@ for (const [name, directory] of Object.entries(binding.directories)) {
   assert.ok(directory.files.every((file) => file.startsWith(`${directory.root}${path.sep}`)));
 }
 
-assert.ok(binding.directories.src.relativeFiles.includes('tcl_polycall_extension.c'));
-assert.ok(binding.directories.include.relativeFiles.includes('tcl_polycall.h'));
-assert.ok(binding.directories.generated.relativeFiles.includes('polycall/polycall_ffi.h'));
+assert.ok(binding.directories.src.relativeFiles.includes('tcl_polycall.c'));
+assert.ok(binding.directories.src.relativeFiles.includes('polycall.tcl'));
 assert.ok(binding.directories.examples.relativeFiles.includes('run.tcl'));
+assert.ok(binding.directories.tests.relativeFiles.includes('polycall.test'));
 assert.ok(binding.directories.dist.relativeFiles.includes('README.md'));
 assert.throws(() => binding.resolve('src', '..', 'package.json'), RangeError);
 
 for (const file of [
   binding.packageIndex,
+  binding.extensionSource,
+  binding.loader,
   binding.makefile,
   binding.config,
   binding.manifest
@@ -50,4 +72,4 @@ for (const file of [
   assert.equal(fs.existsSync(file), true, `missing project file: ${file}`);
 }
 
-console.log('tcl-polycall npm relative-directory index test: PASS');
+console.log('tcl-polycall package metadata test: PASS');
