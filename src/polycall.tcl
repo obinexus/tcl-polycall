@@ -1,4 +1,6 @@
-# Loader for the tcl-polycall native extension.
+# Loader for the tcl-polycall native extension built by `make` into
+# dist/tclpolycall[info sharedlibextension] (.so, .dylib or .dll -- the
+# Makefile uses the same suffix Tcl expects on each platform).
 
 namespace eval ::tclpolycall::loader {
     variable packageRoot [file normalize [file join [file dirname [info script]] ..]]
@@ -6,8 +8,8 @@ namespace eval ::tclpolycall::loader {
 }
 
 if {![file isfile $::tclpolycall::loader::extension]} {
-    return -code error -errorcode {TCLPOLYCALL LOAD MISSING} \
-        "tcl-polycall extension not found at $::tclpolycall::loader::extension; run `npm run build:tcl`"
+    return -code error -errorcode {POLYCALL LOAD MISSING} \
+        "tcl-polycall extension not found at $::tclpolycall::loader::extension; run `make`"
 }
 
 load $::tclpolycall::loader::extension Tclpolycall

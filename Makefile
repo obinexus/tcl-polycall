@@ -1,113 +1,90 @@
-CC ?= gcc
-AR ?= ar
+# tcl-polycall -- Tcl 9 loadable extension over the Polycall binding ABI v1.
+#
+#   make                      build dist/tclpolycall$(SHLIB_EXT)
+#   make test                 run tests/all.tcl against the real core (tclsh9.0)
+#   make install [DESTDIR=..] install the package into $(TCL_PKG_DIR)/tcl-polycall$(VERSION)
+#
+# The core is found through pkg-config (polycall.pc; set PKG_CONFIG_PATH for a
+# non-system prefix) and Tcl through tclConfig.sh (TCL_CONFIG). Nothing is
+# hard-coded: override POLYCALL_CFLAGS / POLYCALL_LIBS / TCL_CFLAGS /
+# TCL_STUB_LIB when needed.
 
-CPPFLAGS ?=
-CPPFLAGS += -Iinclude -Igenerated
-CFLAGS ?= -O2
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
-
-TCL_ROOT ?= C:/ProgramData/tcl9.0.4
-TCL_INCLUDE ?= $(TCL_ROOT)/generic
+VERSION := 1.1.0
+comma := ,
+CC ?= cc
+PKG_CONFIG ?= pkg-config
 TCLSH ?= tclsh9.0
-TCL_STUB_LIB ?=
-POLYCALL_LDFLAGS ?=
 
-BUILD_DIR := build
-LIB_DIR := lib
-DIST_DIR := dist
-ADAPTER_OBJ := $(BUILD_DIR)/tcl_polycall.o
-STATIC_LIB := $(LIB_DIR)/libtcl_polycall.a
-TEST_BIN := $(BUILD_DIR)/tcl_polycall_adapter_test
+# Debian/Ubuntu: prefer the multiarch file. /usr/lib/tcl9.0/tclConfig.sh is a
+# wrapper that needs dpkg-architecture (dpkg-dev) and sources itself forever
+# without it, so it is the last resort.
+TCL_CONFIG ?= $(firstword $(wildcard \
+	/usr/lib/*-linux-gnu*/tcl9.0/tclConfig.sh \
+	/usr/lib64/tcl9.0/tclConfig.sh \
+	/usr/local/lib/tcl9.0/tclConfig.sh \
+	/usr/local/lib/tclConfig.sh \
+	/opt/homebrew/lib/tclConfig.sh \
+	/usr/lib/tcl9.0/tclConfig.sh))
+TCL_CFLAGS ?= $(shell sh -c '. "$(TCL_CONFIG)" && echo $$TCL_INCLUDE_SPEC' 2>/dev/null)
+TCL_STUB_LIB ?= $(shell sh -c '. "$(TCL_CONFIG)" && echo $$TCL_STUB_LIB_SPEC' 2>/dev/null)
+TCL_PKG_DIR ?= $(shell echo 'puts [lindex $$tcl_pkgPath 0]' | $(TCLSH) 2>/dev/null)
 
+POLYCALL_CFLAGS ?= $(shell $(PKG_CONFIG) --cflags polycall)
+POLYCALL_LIBS ?= $(shell $(PKG_CONFIG) --libs polycall)
+POLYCALL_LIBDIR ?= $(shell $(PKG_CONFIG) --variable=libdir polycall)
+
+CFLAGS ?= -O2 -g
+WARN := -std=c11 -Wall -Wextra -Wpedantic -Wno-overlength-strings
+
+UNAME_S := $(shell uname -s 2>/dev/null)
 ifeq ($(OS),Windows_NT)
-EXE_EXT := .exe
-SHARED_EXT := .dll
-TEST_BIN := $(TEST_BIN)$(EXE_EXT)
+SHLIB_EXT := .dll
+PIC :=
+SHARED := -shared
+LINK_EXTRA :=
+else ifeq ($(UNAME_S),Darwin)
+# must match [info sharedlibextension] on macOS, which src/polycall.tcl loads
+SHLIB_EXT := .dylib
+PIC := -fPIC
+SHARED := -dynamiclib
+LINK_EXTRA := $(if $(POLYCALL_LIBDIR),-Wl$(comma)-rpath$(comma)$(POLYCALL_LIBDIR))
 else
-EXE_EXT :=
-SHARED_EXT := .so
+SHLIB_EXT := .so
+PIC := -fPIC
+SHARED := -shared
+# bind every core symbol at load time: an old core without the ABI v1
+# symbols fails `load` with a clear "undefined symbol" error, never later
+LINK_EXTRA := -Wl,-z,now -Wl,--no-undefined $(if $(POLYCALL_LIBDIR),-Wl$(comma)-rpath$(comma)$(POLYCALL_LIBDIR))
 endif
 
-EXTENSION := $(DIST_DIR)/tclpolycall$(SHARED_EXT)
-
-.DEFAULT_GOAL := all
+EXTENSION := dist/tclpolycall$(SHLIB_EXT)
 
 .PHONY: all
-all: $(STATIC_LIB)
+all: $(EXTENSION)
 
-$(BUILD_DIR) $(LIB_DIR) $(DIST_DIR):
-ifeq ($(OS),Windows_NT)
-	@if not exist "$@" mkdir "$@"
-else
-	@mkdir -p $@
-endif
+.PHONY: check-deps
+check-deps:
+	@test -n "$(TCL_CFLAGS)$(TCL_CONFIG)" || { echo "Tcl 9 development files not found (set TCL_CONFIG=/path/to/tclConfig.sh)"; exit 2; }
+	@$(PKG_CONFIG) --exists polycall || { echo "polycall.pc not found (install the Polycall core >= 1.1.0 or set PKG_CONFIG_PATH)"; exit 2; }
 
-$(ADAPTER_OBJ): src/tcl_polycall.c include/tcl_polycall.h generated/polycall/polycall_ffi.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
-
-$(STATIC_LIB): $(ADAPTER_OBJ) | $(LIB_DIR)
-	$(AR) rcs $@ $^
-
-$(TEST_BIN): src/tcl_polycall.c tests/polycall_ffi_mock.c tests/tcl_polycall_adapter_test.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) -Itests $(CFLAGS) $^ -o $@
+$(EXTENSION): src/tcl_polycall.c | check-deps
+	@mkdir -p $(dir $@)
+	$(CC) $(WARN) $(CFLAGS) $(PIC) -DUSE_TCL_STUBS $(TCL_CFLAGS) $(POLYCALL_CFLAGS) $(SHARED) \
+		src/tcl_polycall.c -o $@ $(POLYCALL_LIBS) $(TCL_STUB_LIB) $(LINK_EXTRA) $(LDFLAGS)
 
 .PHONY: test
-test: $(TEST_BIN)
-	$(TEST_BIN)
+test: $(EXTENSION)
+	$(TCLSH) tests/all.tcl $(abspath $(EXTENSION))
 
-.PHONY: tcl-check
-tcl-check:
-	$(CC) $(CPPFLAGS) -I"$(TCL_INCLUDE)" -DUSE_TCL_STUBS $(CFLAGS) -fsyntax-only src/tcl_polycall_extension.c
-
-.PHONY: tcl-check-if-available
-tcl-check-if-available:
-ifeq ($(OS),Windows_NT)
-	@if exist "$(TCL_INCLUDE)\tcl.h" ($(MAKE) tcl-check) else (echo Tcl headers not found at $(TCL_INCLUDE); skipping Tcl source check)
-else
-	@if test -f "$(TCL_INCLUDE)/tcl.h"; then $(MAKE) tcl-check; else echo "Tcl headers not found at $(TCL_INCLUDE); skipping Tcl source check"; fi
-endif
-
-.PHONY: extension
-extension: | $(DIST_DIR)
-ifeq ($(OS),Windows_NT)
-	@if "$(strip $(TCL_STUB_LIB))"=="" (echo Set TCL_STUB_LIB to the Tcl 9 stub library & exit /b 2)
-	@if "$(strip $(POLYCALL_LDFLAGS))"=="" (echo Set POLYCALL_LDFLAGS to the libpolycall linker flags & exit /b 2)
-else
-	@test -n "$(TCL_STUB_LIB)" || (echo "Set TCL_STUB_LIB to the Tcl 9 stub library" && exit 2)
-	@test -n "$(POLYCALL_LDFLAGS)" || (echo "Set POLYCALL_LDFLAGS to the libpolycall linker flags" && exit 2)
-endif
-	$(CC) $(CPPFLAGS) -I"$(TCL_INCLUDE)" -DUSE_TCL_STUBS $(CFLAGS) -shared \
-		src/tcl_polycall.c src/tcl_polycall_extension.c \
-		$(POLYCALL_LDFLAGS) "$(TCL_STUB_LIB)" -o $(EXTENSION)
-
-.PHONY: test-tcl
-test-tcl: | $(BUILD_DIR)
-ifeq ($(OS),Windows_NT)
-	@if "$(strip $(TCL_STUB_LIB))"=="" (echo Set TCL_STUB_LIB to the Tcl 9 stub library & exit /b 2)
-else
-	@test -n "$(TCL_STUB_LIB)" || (echo "Set TCL_STUB_LIB to the Tcl 9 stub library" && exit 2)
-endif
-	$(CC) $(CPPFLAGS) -Itests -I"$(TCL_INCLUDE)" -DUSE_TCL_STUBS $(CFLAGS) -shared \
-		src/tcl_polycall.c src/tcl_polycall_extension.c tests/polycall_ffi_mock.c \
-		"$(TCL_STUB_LIB)" -o $(BUILD_DIR)/tclpolycall$(SHARED_EXT)
-	$(TCLSH) tests/extension-smoke.tcl $(BUILD_DIR)/tclpolycall$(SHARED_EXT)
-
-.PHONY: verify-dry
-verify-dry:
-ifeq ($(OS),Windows_NT)
-	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-dry.ps1
-else
-	sh scripts/verify-dry.sh
-endif
+# Installs a self-contained package directory: pkgIndex.tcl + the extension.
+.PHONY: install
+install: $(EXTENSION)
+	@test -n "$(TCL_PKG_DIR)" || { echo "cannot determine TCL_PKG_DIR; pass TCL_PKG_DIR=..."; exit 2; }
+	mkdir -p "$(DESTDIR)$(TCL_PKG_DIR)/tcl-polycall$(VERSION)"
+	cp $(EXTENSION) "$(DESTDIR)$(TCL_PKG_DIR)/tcl-polycall$(VERSION)/"
+	printf '%s\n' 'package ifneeded tcl-polycall $(VERSION) [list load [file join $$dir tclpolycall[info sharedlibextension]] Tclpolycall]' \
+		> "$(DESTDIR)$(TCL_PKG_DIR)/tcl-polycall$(VERSION)/pkgIndex.tcl"
 
 .PHONY: clean
 clean:
-ifeq ($(OS),Windows_NT)
-	@if exist "$(BUILD_DIR)" rmdir /s /q "$(BUILD_DIR)"
-	@if exist "$(LIB_DIR)" rmdir /s /q "$(LIB_DIR)"
-	@if exist "$(EXTENSION)" del /q "$(EXTENSION)"
-else
-	rm -rf $(BUILD_DIR) $(LIB_DIR) $(EXTENSION)
-endif
-
--include $(ADAPTER_OBJ:.o=.d)
+	rm -rf build dist/tclpolycall.so dist/tclpolycall.dylib dist/tclpolycall.dll

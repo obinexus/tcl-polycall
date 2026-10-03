@@ -5,3 +5,4 @@
 /dist/*.so
 *.d
 *.o
+*.tgz

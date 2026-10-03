@@ -1,9 +1,14 @@
 # Adapter boundary
 
-`tcl_polycall_run_config()` is the only native language-adapter operation. It
-passes the caller's UTF-8 configuration path to
-`polycall_ffi_run_config(config_path, 1)` and returns the core status unchanged.
+`tcl_polycall.c` is a Tcl 9 extension (stubs-enabled) that includes the real
+`<polycall.h>` and links libpolycall through pkg-config. Each Tcl command
+translates Tcl objects to the binding ABI v1 C call and back: strings as
+UTF-8, payloads as byte arrays `(pointer, length)`, handles as int32,
+caller-owned output buffers. Statuses become Tcl errors with
+`-errorcode {POLYCALL <NAME> <status> <polycall_last_error> ?extra?}`.
 
-`tcl_polycall_extension.c` only translates between Tcl objects and that C
-function. Configuration parsing, validation, and runtime behavior remain in
-libpolycall.
+`::polycall::run_config ?path?` keeps the documented contract:
+`polycall_ffi_run_config(path, 1)` with the status returned unchanged.
+
+Configuration parsing, the wire protocols and the peer transport stay in
+libpolycall; this extension has no parser and no network code.
