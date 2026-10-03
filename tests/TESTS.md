@@ -16,7 +16,8 @@
 - `polycall.test` — library (version, ABI, strerror, last_error, missing
   core, old core, ABI 2), config (valid / missing / invalid / strict unknown
   key / TLS / describe / non-ASCII path), call (success, unknown op, remote
-  error, deadline, invalid input, no runtime, `polycall daemon`), peer
+  error, deadline, invalid input, no runtime, `polycall daemon`, timeout
+  boundaries), peer
   (identity, both directions, payload matrix, registry ownership, duplicate
   id, auth, dead peer, timeout, too-small buffer, cancel / close waking
   blocked receivers in threads, handle lifecycle, invalid ids, 8 concurrent

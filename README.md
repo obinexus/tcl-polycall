@@ -105,7 +105,7 @@ resolving to the installed copy, against the **real installed core**:
 version/ABI, a missing core, an old core (missing symbols) and an ABI 2 core
 in child interpreters, `run_config` (valid, missing, invalid, strict, TLS,
 non-ASCII path), `call` against a live `polycall start` runtime and a
-`polycall daemon`, two nodes both directions, payload matrix (empty, UTF-8,
+`polycall daemon`, timeout boundaries, two nodes both directions, payload matrix (empty, UTF-8,
 binary + NUL, 1 MiB, 1 MiB + 1), registry ownership, de-duplication, auth,
 dead peers, timeouts, small buffers, cancel and close waking blocked receivers
 (Thread), handle lifecycle, concurrent senders in 8 threads, and interop with

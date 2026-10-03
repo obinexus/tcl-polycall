@@ -228,6 +228,19 @@ test call-7 {against a `polycall daemon`: success, unknown operation, remote err
         [lindex $ec 2] [string match *item.unknown* [lindex $ec 4]]
 } {{{"item_id":"widget-a","quantity":42,"in_stock":true}} -7 -9 1}
 
+test call-8 {timeout boundaries: call 1..600000 ms, uint32 range checked before recv} realcore {
+    set ep $::env(POLYCALL_TEST_RPC_ENDPOINT)
+    set b [polycall::peer open beta]
+    set r [list [polycall::call $ep debug echo "" 600000] \
+        [status_of {polycall::call $ep debug echo "" 600001}] \
+        [status_of {polycall::call $ep debug echo "" 0}] \
+        [status_of {polycall::peer recv $b -1}] \
+        [status_of {polycall::peer recv $b 4294967296}] \
+        [status_of {polycall::peer recv $b 1}]]
+    polycall::peer close $b
+    set r
+} {{{"echo":null}} -1 -1 -1 -1 -4}
+
 # ---- peers -------------------------------------------------------------------------
 
 test peer-1 {identity, endpoint and send-only node} realcore {
