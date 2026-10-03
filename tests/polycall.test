@@ -1,15 +1,21 @@
-# tcl-polycall real-core tests (tcltest). Run through tests/run-real-core.sh,
-# which builds and installs the extension, starts a `polycall start` runtime
-# and exports POLYCALL_* test variables. Without them every test is SKIPPED.
+# tcl-polycall real-core tests (tcltest), Tcl 9.0 and 8.6, Linux and Windows.
+# Run through tests/run-real-core.sh, which builds and installs the
+# extension, starts a `polycall start` runtime and a `polycall daemon` and
+# exports POLYCALL_* test variables. Without them every test is SKIPPED.
 
 package require tcltest 2.5
 namespace import ::tcltest::*
 
 set ::pc_version [package require tcl-polycall]
 set ::pc_load [package ifneeded tcl-polycall $::pc_version]
+set ::pc_ext [lindex $::pc_load 1]          ;# load <path> Tclpolycall
+set ::pc_windows [expr {$::tcl_platform(platform) eq "windows"}]
+# Tcl 8.6 strings are UCS-2: characters outside the BMP become U+FFFD
+set ::pc_tcl9 [package vsatisfies [info tclversion] 9-]
 
 testConstraint realcore [expr {[info exists ::env(POLYCALL_TEST_RPC_ENDPOINT)] && [info exists ::env(POLYCALL_CLI)]}]
-testConstraint threads [expr {![catch {package require Thread 3}]}]
+testConstraint daemon [info exists ::env(POLYCALL_TEST_DAEMON_ENDPOINT)]
+testConstraint threads [expr {![catch {package require Thread}]}]
 testConstraint norpath [expr {[info exists ::env(TCL_POLYCALL_NORPATH_EXT)] && [file exists $::env(TCL_POLYCALL_NORPATH_EXT)]}]
 
 proc tmp {name} { file join $::env(POLYCALL_TEST_TMP) $name }
@@ -41,16 +47,37 @@ proc take {h {timeout 3000}} {
 }
 proc child_tcl {env script} {
     # run SCRIPT (as a file, so an error exits non-zero) in a fresh tclsh
-    # with ENV (dict) added; returns {exitcode output}
+    # with ENV (dict) set in its environment; returns {exitcode output}.
+    # ::env is restored afterwards (exec passes the current ::env on).
     set file [tmp child-[clock microseconds].tcl]
     set f [open $file w]; puts $f $script; close $f
-    # env(1) sets the child's environment; this interpreter's ::env is untouched
-    set assignments {}
-    foreach {k v} $env { lappend assignments "$k=$v" }
-    set rc [catch {exec env {*}$assignments [info nameofexecutable] $file 2>@1} out opts]
+    set saved {}
+    foreach {k v} $env {
+        lappend saved $k [expr {[info exists ::env($k)] ? [list 1 $::env($k)] : [list 0 {}]}]
+        set ::env($k) $v
+    }
+    set rc [catch {exec [info nameofexecutable] $file 2>@1} out opts]
+    foreach {k s} $saved {
+        if {[lindex $s 0]} { set ::env($k) [lindex $s 1] } else { unset ::env($k) }
+    }
     set code 0
     if {$rc} { set code [lindex [dict get $opts -errorcode] 2] }
     list $code $out
+}
+# Child-process setup in which the loader finds the library in DIR first.
+# Linux: LD_LIBRARY_PATH (searched before the extension's RUNPATH).
+# Windows: a copy of the extension in DIR (the loading DLL's directory is
+# searched first), and a PATH without the core.
+proc loader_case {dir} {
+    if {$::pc_windows} {
+        file copy -force $::pc_ext $dir
+        set ext [file join $dir [file tail $::pc_ext]]
+        return [list [list PATH [file join $::env(SystemRoot) System32]] "load [list $ext] Tclpolycall"]
+    }
+    return [list [list LD_LIBRARY_PATH $dir] "package require tcl-polycall"]
+}
+proc kill_pid {pid} {
+    if {$::pc_windows} { exec taskkill /F /PID $pid } else { exec kill $pid }
 }
 
 # ---- library ----------------------------------------------------------------
@@ -75,20 +102,36 @@ test library-3 {errors carry status, name and polycall_last_error detail} realco
 } {POLYCALL_E_INVALID_HANDLE -3 1 0 {}}
 
 test library-4 {missing libpolycall: load fails with a clear error} {realcore norpath} {
-    lassign [child_tcl [list LD_LIBRARY_PATH /nonexistent] \
-        "load [list $::env(TCL_POLYCALL_NORPATH_EXT)] Tclpolycall"] code out
-    list [expr {$code != 0}] [string match "*libpolycall.so.1*" $out]
+    # Linux: the dynamic loader names the missing SONAME. Windows: Tcl reports
+    # that a dependent library of the extension could not be found.
+    if {$::pc_windows} {
+        set cenv [list PATH [file join $::env(SystemRoot) System32]]
+        set pattern "*dependent library could not be found*"
+    } else {
+        set cenv [list LD_LIBRARY_PATH /nonexistent]
+        set pattern "*libpolycall.so.1*"
+    }
+    lassign [child_tcl $cenv "load [list $::env(TCL_POLYCALL_NORPATH_EXT)] Tclpolycall"] code out
+    list [expr {$code != 0}] [string match $pattern $out]
 } {1 1}
 
-test library-5 {old core without ABI v1 symbols: load fails naming the symbol} realcore {
-    lassign [child_tcl [list LD_LIBRARY_PATH [file dirname $::env(POLYCALL_TEST_FAKE_OLD)]] \
-        "package require tcl-polycall"] code out
-    list [expr {$code != 0}] [string match "*undefined symbol: polycall_*" $out]
+test library-5 {old core without ABI v1 symbols: load fails, no crash} realcore {
+    # every core symbol is bound at load time (-z now on Linux, import table
+    # on Windows), so an old core fails `load` instead of a later call
+    lassign [loader_case [file dirname $::env(POLYCALL_TEST_FAKE_OLD)]] cenv script
+    lassign [child_tcl $cenv $script] code out
+    # Windows (ERROR_PROC_NOT_FOUND) does not name the symbol; Tcl 8.6 says
+    # "A function specified in the import table could not be resolved"
+    set re [expr {$::pc_windows ? {import table could not be resolved|specified procedure} : {undefined symbol: polycall_}}]
+    list [expr {$code != 0}] [regexp $re $out]
 } {1 1}
 
 test library-6 {ABI mismatch: Init refuses the library} realcore {
-    lassign [child_tcl [list LD_LIBRARY_PATH [file dirname $::env(POLYCALL_TEST_FAKE_ABI2)]] \
-        {if {[catch {package require tcl-polycall} m o]} { puts "$m | [dict get $o -errorcode]"; exit 3 }}] code out
+    lassign [loader_case [file dirname $::env(POLYCALL_TEST_FAKE_ABI2)]] cenv script
+    set child [string map [list @LOAD@ $script] {
+        if {[catch {@LOAD@} m o]} { puts "$m | [dict get $o -errorcode]"; exit 3 }
+    }]
+    lassign [child_tcl $cenv $child] code out
     list $code [string match "*reports binding ABI 2*POLYCALL_E_UNSUPPORTED*" $out]
 } {3 1}
 
@@ -124,14 +167,31 @@ test config-5 {tls_enabled=true: refused, not faked, when strict} realcore {
     list [polycall::run_config $p 0] [polycall::run_config $p 1] [string match -nocase *tls* [polycall::last_error]]
 } {0 -15 1}
 
+test config-6 {non-ASCII configuration path (UTF-8 to the core; _wfopen on Windows)} realcore {
+    # BMP characters only, so the same names work in Tcl 8.6
+    set dir [tmp "cfg-üñî-日本-ж"]
+    file mkdir $dir
+    set good [file join $dir "tcl-polycallrc-é"]
+    set f [open $good w]; puts -nonewline $f "log_level=info\nmax_connections=8\n"; close $f
+    set bad [file join $dir "bad-é"]
+    set f [open $bad w]; puts -nonewline $f "max_connections=lots\n"; close $f
+    list [file exists $good] [polycall::run_config $good] [polycall::run_config_or_error $good 1] \
+        [string match {*"layer"*} [polycall::describe $good]] \
+        [polycall::run_config $bad 0] [string match *max_connections* [polycall::last_error]] \
+        [polycall::run_config [file join $dir "missing-é"]]
+} {1 0 0 1 -13 1 -7}
+
 # ---- polycall_call -----------------------------------------------------------------
+
+# non-BMP text only where Tcl can hold it (Tcl 9); Tcl 8.6 strings are UCS-2
+set ::pc_text [expr {$::pc_tcl9 ? "h\u00e9 \u4e16 \U1F30D" : "h\u00e9 \u4e16"}]
 
 test call-1 {success} realcore {
     set ep $::env(POLYCALL_TEST_RPC_ENDPOINT)
     list [polycall::call $ep inventory get {{"item_id":"widget-a"}} 2000] \
         [polycall::call $ep debug echo "" 2000] \
-        [polycall::call $ep debug echo "{\"s\":\"h\u00e9 \U1F30D\"}" 2000]
-} [list {{"item_id":"widget-a","quantity":42,"in_stock":true}} {{"echo":null}} "{\"echo\":{\"s\":\"h\u00e9 \U1F30D\"}}"]
+        [polycall::call $ep debug echo "{\"s\":\"$::pc_text\"}" 2000]
+} [list {{"item_id":"widget-a","quantity":42,"in_stock":true}} {{"echo":null}} "{\"echo\":{\"s\":\"$::pc_text\"}}"]
 
 test call-2 {unknown operation} realcore {
     status_of {polycall::call $::env(POLYCALL_TEST_RPC_ENDPOINT) inventory teleport {{}} 2000}
@@ -159,6 +219,14 @@ test call-5 {invalid input} realcore {
 test call-6 {no runtime} realcore {
     status_of {polycall::call 127.0.0.1:1 inventory get {{}} 1000}
 } -5
+
+test call-7 {against a `polycall daemon`: success, unknown operation, remote error} {realcore daemon} {
+    set ep $::env(POLYCALL_TEST_DAEMON_ENDPOINT)
+    set ec [errorcode_of {polycall::call $ep inventory get {{"item_id":"nope"}} 2000}]
+    list [polycall::call $ep inventory get {{"item_id":"widget-a"}} 2000] \
+        [status_of {polycall::call $ep inventory teleport {{}} 2000}] \
+        [lindex $ec 2] [string match *item.unknown* [lindex $ec 4]]
+} {{{"item_id":"widget-a","quantity":42,"in_stock":true}} -7 -9 1}
 
 # ---- peers -------------------------------------------------------------------------
 
@@ -193,10 +261,14 @@ test peer-3 {payload matrix: empty, UTF-8, binary+NUL, 1 MiB, 1 MiB + 1} realcor
     set r {}
     polycall::peer send $a beta "" empty-1
     lappend r [take $b]
-    set u [utf8 "h\u00e9llo \u2014 \u4e16\u754c \U1F30D"]
+    # "h\u00e9llo \u2014 \u4e16\u754c \U1F30D" as explicit UTF-8 bytes (Tcl 8.6 cannot hold U+1F30D)
+    set u [binary decode hex 68c3a96c6c6f20e2809420e4b896e7958c20f09f8c8d]
     polycall::peer send $a beta $u utf8-1
     lassign [take $b] f id p
-    lappend r [list $f $id [expr {$p eq $u}] [string length $p] [encoding convertfrom utf-8 $p]]
+    set text [encoding convertfrom utf-8 $p]
+    lappend r [list $f $id [expr {$p eq $u}] [string length $p] \
+        [expr {[string range $text 0 10] eq "h\u00e9llo \u2014 \u4e16\u754c "}] \
+        [expr {!$::pc_tcl9 || $text eq "h\u00e9llo \u2014 \u4e16\u754c \U1F30D"}]]
     set bin "[all_bytes]\x00\x00tail\x00"
     polycall::peer send $a beta $bin binary-1
     lassign [take $b] f id p
@@ -209,8 +281,7 @@ test peer-3 {payload matrix: empty, UTF-8, binary+NUL, 1 MiB, 1 MiB + 1} realcor
     lappend r [status_of {polycall::peer recv $b 200}]
     polycall::peer close $a; polycall::peer close $b
     set r
-} [list {alpha empty-1 {}} [list alpha utf8-1 1 22 "h\u00e9llo \u2014 \u4e16\u754c \U1F30D"] \
-       {alpha binary-1 1 263} {max-1 1048576 1} -10 -4]
+} {{alpha empty-1 {}} {alpha utf8-1 1 22 1 1} {alpha binary-1 1 263} {max-1 1048576 1} -10 -4}
 
 test peer-4 {registry belongs to its node only} realcore {
     set a [polycall::peer open alpha]; set b [polycall::peer open beta]
@@ -408,7 +479,7 @@ proc start_cli_node {id} {
         }
         after 100
     }
-    exec kill $pid
+    kill_pid $pid
     error "polycall peer serve did not start"
 }
 proc json_field {json key} {
@@ -419,26 +490,29 @@ proc json_field {json key} {
 test interop-1 {Tcl peer <-> `polycall peer serve` C node, both directions} realcore {
     lassign [start_cli_node cnode] cpid cep
     set h [polycall::peer open tcl-node 127.0.0.1:0 $::env(POLYCALL_DEV_TOKEN)]
-    polycall::peer register $h cnode $cep
-    polycall::peer ping $h cnode 2000
-    set payload "tcl\x00to\xffC [all_bytes]"
-    polycall::peer send $h cnode $payload tcl-to-c-1
-    set out [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000]
-    set r [list [json_field $out from] [json_field $out id] \
-        [expr {[json_field $out payload_b64] eq [binary encode base64 $payload]}]]
-    set back "C\x00to Tcl [string reverse [all_bytes]]"
-    set f [open [tmp c-to-tcl.bin] wb]; puts -nonewline $f $back; close $f
-    exec $::env(POLYCALL_CLI) peer send --from cnode --to [polycall::peer endpoint $h] \
-        --id c-to-tcl-1 --payload-file [tmp c-to-tcl.bin]
-    lassign [take $h] f id p
-    lappend r $f $id [expr {$p eq $back}]
-    polycall::peer send $h cnode again tcl-dup-1
-    polycall::peer send $h cnode again tcl-dup-1
-    lappend r [json_field [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000] id]
-    lappend r [catch {exec $::env(POLYCALL_CLI) peer recv --to $cep -t 300} m o] \
-        [lindex [dict get $o -errorcode] 2]
-    exec kill $cpid
-    polycall::peer close $h
+    try {
+        polycall::peer register $h cnode $cep
+        polycall::peer ping $h cnode 2000
+        set payload "tcl\x00to\xffC [all_bytes]"
+        polycall::peer send $h cnode $payload tcl-to-c-1
+        set out [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000]
+        set r [list [json_field $out from] [json_field $out id] \
+            [expr {[json_field $out payload_b64] eq [binary encode base64 $payload]}]]
+        set back "C\x00to Tcl [string reverse [all_bytes]]"
+        set f [open [tmp c-to-tcl.bin] wb]; puts -nonewline $f $back; close $f
+        exec $::env(POLYCALL_CLI) peer send --from cnode --to [polycall::peer endpoint $h] \
+            --id c-to-tcl-1 --payload-file [tmp c-to-tcl.bin]
+        lassign [take $h] f id p
+        lappend r $f $id [expr {$p eq $back}]
+        polycall::peer send $h cnode again tcl-dup-1
+        polycall::peer send $h cnode again tcl-dup-1
+        lappend r [json_field [exec $::env(POLYCALL_CLI) peer recv --to $cep -t 3000] id]
+        lappend r [catch {exec $::env(POLYCALL_CLI) peer recv --to $cep -t 300} m o] \
+            [lindex [dict get $o -errorcode] 2]
+    } finally {
+        kill_pid $cpid
+        polycall::peer close $h
+    }
     set r
 } {tcl-node tcl-to-c-1 1 cnode c-to-tcl-1 1 tcl-dup-1 1 6}
 
