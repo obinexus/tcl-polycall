@@ -3,7 +3,7 @@
 Tcl loadable extension (Tcl 9.0 and Tcl 8.6) for the [Polycall](https://github.com/obinexus/polycall)
 core's **binding ABI v1** (`polycall.h`, libpolycall >= 1.1.0): configuration
 validation, `polycall_rpc` calls and peer-to-peer nodes. Tcl package
-`tcl-polycall` 1.1.0; npm source distribution `@obinexusltd/tcl-polycall`
+`tcl-polycall` 1.1.0; npm source distribution `tcl-polycall`
 (not published yet).
 
 `src/tcl_polycall.c` is a stubs-enabled Tcl extension that includes the real

@@ -56,7 +56,7 @@ function resolve(directoryName, ...segments) {
 }
 
 module.exports = Object.freeze({
-  packageName: '@obinexusltd/tcl-polycall',
+  packageName: 'tcl-polycall',
   projectRoot: __dirname,
   directories,
   resolve,
