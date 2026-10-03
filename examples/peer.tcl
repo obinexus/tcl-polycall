@@ -1,4 +1,4 @@
-# tclsh9.0 examples/peer.tcl   (after `make`)
+# tclsh examples/peer.tcl   (Tcl 9.0 or 8.6, after `make` for that Tcl)
 # Two peer nodes in one interpreter exchange a payload in each direction.
 lappend auto_path [file normalize [file join [file dirname [info script]] ..]]
 package require tcl-polycall 1.1.0

@@ -1,4 +1,4 @@
-# tclsh9.0 examples/run.tcl ?configPath?   (after `make`)
+# tclsh examples/run.tcl ?configPath?   (Tcl 9.0 or 8.6, after `make` for that Tcl)
 # Validates a configuration file with the core: polycall_ffi_run_config(path, 1).
 set projectRoot [file normalize [file join [file dirname [info script]] ..]]
 lappend auto_path $projectRoot

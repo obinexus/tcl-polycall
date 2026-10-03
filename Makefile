@@ -1,30 +1,35 @@
-# tcl-polycall -- Tcl 9 loadable extension over the Polycall binding ABI v1.
+# tcl-polycall -- Tcl loadable extension over the Polycall binding ABI v1.
 #
-#   make                      build dist/tclpolycall$(SHLIB_EXT)
-#   make test                 run tests/all.tcl against the real core (tclsh9.0)
+#   make                      build dist/tclpolycall$(SHLIB_EXT) for Tcl 9.0
+#   make TCL_VERSION=8.6      build it for Tcl 8.6 instead (TCLSH=tclsh8.6)
+#   make test                 tests/run-real-core.sh: build, install, test against the real core
 #   make install [DESTDIR=..] install the package into $(TCL_PKG_DIR)/tcl-polycall$(VERSION)
 #
 # The core is found through pkg-config (polycall.pc; set PKG_CONFIG_PATH for a
 # non-system prefix) and Tcl through tclConfig.sh (TCL_CONFIG). Nothing is
 # hard-coded: override POLYCALL_CFLAGS / POLYCALL_LIBS / TCL_CFLAGS /
-# TCL_STUB_LIB when needed.
+# TCL_STUB_LIB when needed. Windows: build from an MSYS2 UCRT64 / MINGW64
+# shell, e.g. `make TCL_VERSION=8.6 TCLSH=tclsh86` with MSYS2's Tcl.
 
 VERSION := 1.1.0
 comma := ,
 CC ?= cc
 PKG_CONFIG ?= pkg-config
-TCLSH ?= tclsh9.0
+TCL_VERSION ?= 9.0
+TCLSH ?= tclsh$(TCL_VERSION)
 
 # Debian/Ubuntu: prefer the multiarch file. /usr/lib/tcl9.0/tclConfig.sh is a
 # wrapper that needs dpkg-architecture (dpkg-dev) and sources itself forever
-# without it, so it is the last resort.
+# without it, so it is the last resort. MSYS2 keeps it in $MSYSTEM_PREFIX/lib.
 TCL_CONFIG ?= $(firstword $(wildcard \
-	/usr/lib/*-linux-gnu*/tcl9.0/tclConfig.sh \
-	/usr/lib64/tcl9.0/tclConfig.sh \
-	/usr/local/lib/tcl9.0/tclConfig.sh \
+	/usr/lib/*-linux-gnu*/tcl$(TCL_VERSION)/tclConfig.sh \
+	/usr/lib64/tcl$(TCL_VERSION)/tclConfig.sh \
+	/usr/local/lib/tcl$(TCL_VERSION)/tclConfig.sh \
 	/usr/local/lib/tclConfig.sh \
 	/opt/homebrew/lib/tclConfig.sh \
-	/usr/lib/tcl9.0/tclConfig.sh))
+	$(if $(MSYSTEM_PREFIX),$(MSYSTEM_PREFIX)/lib/tclConfig.sh) \
+	/usr/lib/tcl$(TCL_VERSION)/tclConfig.sh))
+TCL_CONFIG_VERSION := $(shell sh -c '. "$(TCL_CONFIG)" && echo $$TCL_VERSION' 2>/dev/null)
 TCL_CFLAGS ?= $(shell sh -c '. "$(TCL_CONFIG)" && echo $$TCL_INCLUDE_SPEC' 2>/dev/null)
 TCL_STUB_LIB ?= $(shell sh -c '. "$(TCL_CONFIG)" && echo $$TCL_STUB_LIB_SPEC' 2>/dev/null)
 TCL_PKG_DIR ?= $(shell echo 'puts [lindex $$tcl_pkgPath 0]' | $(TCLSH) 2>/dev/null)
@@ -37,7 +42,7 @@ CFLAGS ?= -O2 -g
 WARN := -std=c11 -Wall -Wextra -Wpedantic -Wno-overlength-strings
 
 UNAME_S := $(shell uname -s 2>/dev/null)
-ifeq ($(OS),Windows_NT)
+ifneq ($(filter Windows_NT,$(OS))$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)),)
 SHLIB_EXT := .dll
 PIC :=
 SHARED := -shared
@@ -64,7 +69,8 @@ all: $(EXTENSION)
 
 .PHONY: check-deps
 check-deps:
-	@test -n "$(TCL_CFLAGS)$(TCL_CONFIG)" || { echo "Tcl 9 development files not found (set TCL_CONFIG=/path/to/tclConfig.sh)"; exit 2; }
+	@test -n "$(TCL_CFLAGS)$(TCL_CONFIG)" || { echo "Tcl $(TCL_VERSION) development files not found (set TCL_CONFIG=/path/to/tclConfig.sh)"; exit 2; }
+	@test -z "$(TCL_CONFIG_VERSION)" || test "$(TCL_CONFIG_VERSION)" = "$(TCL_VERSION)" || { echo "$(TCL_CONFIG) is Tcl $(TCL_CONFIG_VERSION), not $(TCL_VERSION) (set TCL_VERSION or TCL_CONFIG)"; exit 2; }
 	@$(PKG_CONFIG) --exists polycall || { echo "polycall.pc not found (install the Polycall core >= 1.1.0 or set PKG_CONFIG_PATH)"; exit 2; }
 
 $(EXTENSION): src/tcl_polycall.c | check-deps
@@ -73,8 +79,8 @@ $(EXTENSION): src/tcl_polycall.c | check-deps
 		src/tcl_polycall.c -o $@ $(POLYCALL_LIBS) $(TCL_STUB_LIB) $(LINK_EXTRA) $(LDFLAGS)
 
 .PHONY: test
-test: $(EXTENSION)
-	$(TCLSH) tests/all.tcl $(abspath $(EXTENSION))
+test:
+	TCLSH=$(TCLSH) sh tests/run-real-core.sh
 
 # Installs a self-contained package directory: pkgIndex.tcl + the extension.
 .PHONY: install

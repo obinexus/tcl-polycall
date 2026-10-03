@@ -1,7 +1,7 @@
 {
   "name": "@obinexusltd/tcl-polycall",
   "version": "1.1.0",
-  "description": "Tcl 9 extension for the Polycall binding ABI v1 (libpolycall >= 1.1.0): config validation, RPC calls and peer nodes",
+  "description": "Tcl 9.0 / 8.6 extension for the Polycall binding ABI v1 (libpolycall >= 1.1.0): config validation, RPC calls and peer nodes",
   "main": "index.js",
   "type": "commonjs",
   "exports": {
@@ -51,6 +51,7 @@
     "libpolycall",
     "tcl",
     "tcl9",
+    "tcl8.6",
     "extension",
     "peer-to-peer"
   ],

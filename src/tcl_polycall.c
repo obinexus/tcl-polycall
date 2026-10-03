@@ -1,6 +1,6 @@
 /*
- * tcl-polycall -- Tcl 9 loadable extension over the Polycall binding ABI v1
- * (polycall.h, libpolycall >= 1.1.0).
+ * tcl-polycall -- Tcl loadable extension (Tcl 9.0, and Tcl 8.6) over the
+ * Polycall binding ABI v1 (polycall.h, libpolycall >= 1.1.0).
  *
  *   load tclpolycall[info sharedlibextension] Tclpolycall   (or package require tcl-polycall)
  *
@@ -24,6 +24,10 @@
  *
  * The library is linked through pkg-config (polycall.pc); Tclpolycall_Init
  * refuses a library whose polycall_ffi_abi_version() is not 1.
+ *
+ * One source builds for the Tcl it is compiled against: Tcl 9 (Tcl_Size,
+ * Tcl_CreateObjCommand2, Tcl_GetBytesFromObj) or Tcl 8.6 (the fallbacks
+ * below). A build for one major version does not load into the other.
  */
 
 #include <polycall.h>
@@ -36,6 +40,47 @@
 
 #define TCL_POLYCALL_VERSION "1.1.0"
 #define DETAIL_MAX 1024
+
+/* ---- Tcl 8.6 / 9 ---------------------------------------------------------- */
+
+#if TCL_MAJOR_VERSION < 8 || (TCL_MAJOR_VERSION == 8 && TCL_MINOR_VERSION < 6)
+#  error "tcl-polycall needs Tcl 8.6 or Tcl 9"
+#endif
+
+#if TCL_MAJOR_VERSION >= 9
+#  define PC_TCL_MIN "9.0"
+#  define PC_ObjCmdProc Tcl_ObjCmdProc2
+#  define PC_CreateObjCommand Tcl_CreateObjCommand2
+#  define pc_get_bytes Tcl_GetBytesFromObj
+#else
+#  define PC_TCL_MIN "8.6"
+#  ifndef TCL_SIZE_MAX
+typedef int Tcl_Size;            /* Tcl 8.6: lengths and objc are int */
+#  endif
+#  define PC_ObjCmdProc Tcl_ObjCmdProc
+#  define PC_CreateObjCommand Tcl_CreateObjCommand
+
+/* Tcl 8.6 has no Tcl_GetBytesFromObj, and Tcl_GetByteArrayFromObj silently
+ * keeps only the low byte of characters above U+00FF. Refuse those, as
+ * Tcl 9 does, so a text payload is never truncated on the way to the core. */
+static unsigned char *pc_get_bytes(Tcl_Interp *interp, Tcl_Obj *obj, Tcl_Size *len)
+{
+    if (obj->typePtr != Tcl_GetObjType("bytearray")) {
+        int n = 0, i;
+        const Tcl_UniChar *u = Tcl_GetUnicodeFromObj(obj, &n);
+        for (i = 0; i < n; ++i) {
+            if (u[i] > 0xFF) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                    "expected byte sequence but character %d was U+%04X "
+                    "(use encoding convertto utf-8)", i, (unsigned)u[i]));
+                Tcl_SetErrorCode(interp, "TCL", "VALUE", "BYTES", NULL);
+                return NULL;
+            }
+        }
+    }
+    return Tcl_GetByteArrayFromObj(obj, len);
+}
+#endif
 
 /* ---- errors ------------------------------------------------------------- */
 
@@ -133,10 +178,10 @@ static int sized_text(Tcl_Interp *interp, sized_fn fn, polycall_peer_t h, const 
         st = fn(h, buf, cap, &len);
         if (st == POLYCALL_OK) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, (Tcl_Size)len));
-            Tcl_Free(buf);
+            Tcl_Free((char *)buf);
             return TCL_OK;
         }
-        Tcl_Free(buf);
+        Tcl_Free((char *)buf);
         if (st != POLYCALL_E_TOO_LARGE) return fail(interp, st, what, NULL);
         cap = len + 1;
     }
@@ -241,10 +286,10 @@ static int DescribeCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *con
         n = polycall_ffi_describe(path, buf, cap);
         if (n >= 0 && n < cap) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj(buf, n));
-            Tcl_Free(buf);
+            Tcl_Free((char *)buf);
             return TCL_OK;
         }
-        Tcl_Free(buf);
+        Tcl_Free((char *)buf);
         if (n < 0) return fail(interp, n, "describe", NULL);
         cap = n + 1;
     }
@@ -273,14 +318,14 @@ static int CallCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const o
         Tcl_Obj *what = Tcl_ObjPrintf("call %s.%s at %s", Tcl_GetString(objv[2]),
                                       Tcl_GetString(objv[3]), Tcl_GetString(objv[1]));
         int rc;
-        Tcl_Free(out);
+        Tcl_Free((char *)out);
         Tcl_IncrRefCount(what);
         rc = fail(interp, st, Tcl_GetString(what), extra);
         Tcl_DecrRefCount(what);
         return rc;
     }
     Tcl_SetObjResult(interp, Tcl_NewStringObj(out, (Tcl_Size)len));
-    Tcl_Free(out);
+    Tcl_Free((char *)out);
     return TCL_OK;
 }
 
@@ -393,7 +438,7 @@ static int PeerCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const o
             return TCL_ERROR;
         }
         /* binary-safe: the payload is a byte array (encoding convertto / binary format) */
-        bytes = Tcl_GetBytesFromObj(interp, objv[4], &n);
+        bytes = pc_get_bytes(interp, objv[4], &n);
         if (!bytes) return TCL_ERROR;
         if (objc >= 6) mid = opt_string(objv[5]);
         if (objc == 7 && get_timeout(interp, objv[6], &timeout) != TCL_OK) return TCL_ERROR;
@@ -422,18 +467,18 @@ static int PeerCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const o
         buf = (unsigned char *)Tcl_Alloc(cap ? cap : 1);
         st = polycall_peer_recv(h, timeout, sender, sizeof sender, mid, sizeof mid, buf, cap, &len);
         if (st == POLYCALL_E_TOO_LARGE) {
-            Tcl_Free(buf);
+            Tcl_Free((char *)buf);
             return fail(interp, st, "peer recv", Tcl_NewWideIntObj((Tcl_WideInt)len));
         }
         if (st != POLYCALL_OK) {
-            Tcl_Free(buf);
+            Tcl_Free((char *)buf);
             return fail(interp, st, "peer recv", NULL);
         }
         d = Tcl_NewDictObj();
         Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("sender", -1), Tcl_NewStringObj(sender, -1));
         Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("message_id", -1), Tcl_NewStringObj(mid, -1));
         Tcl_DictObjPut(NULL, d, Tcl_NewStringObj("payload", -1), Tcl_NewByteArrayObj(buf, (Tcl_Size)len));
-        Tcl_Free(buf);
+        Tcl_Free((char *)buf);
         Tcl_SetObjResult(interp, d);
         return TCL_OK;
     }
@@ -448,7 +493,7 @@ static int PeerCmd(void *cd, Tcl_Interp *interp, Tcl_Size objc, Tcl_Obj *const o
 
 DLLEXPORT int Tclpolycall_Init(Tcl_Interp *interp)
 {
-    static const struct { const char *name; Tcl_ObjCmdProc2 *proc; } cmds[] = {
+    static const struct { const char *name; PC_ObjCmdProc *proc; } cmds[] = {
         { "::polycall::abi_version", AbiVersionCmd },
         { "::polycall::version", VersionCmd },
         { "::polycall::strerror", StrerrorCmd },
@@ -462,7 +507,7 @@ DLLEXPORT int Tclpolycall_Init(Tcl_Interp *interp)
     size_t i;
     int abi;
 
-    if (Tcl_InitStubs(interp, "9.0", 0) == NULL) return TCL_ERROR;
+    if (Tcl_InitStubs(interp, PC_TCL_MIN, 0) == NULL) return TCL_ERROR;
 
     abi = polycall_ffi_abi_version();
     if (abi != POLYCALL_FFI_ABI_VERSION) {
@@ -478,7 +523,7 @@ DLLEXPORT int Tclpolycall_Init(Tcl_Interp *interp)
         return TCL_ERROR;
     }
     for (i = 0; i < sizeof cmds / sizeof cmds[0]; ++i) {
-        if (Tcl_CreateObjCommand2(interp, cmds[i].name, cmds[i].proc, NULL, NULL) == NULL) return TCL_ERROR;
+        if (PC_CreateObjCommand(interp, cmds[i].name, cmds[i].proc, NULL, NULL) == NULL) return TCL_ERROR;
     }
     Tcl_SetVar2Ex(interp, "::polycall::WAIT_FOREVER", NULL, Tcl_NewStringObj("forever", -1), TCL_GLOBAL_ONLY);
     return Tcl_PkgProvide(interp, "tcl-polycall", TCL_POLYCALL_VERSION);
