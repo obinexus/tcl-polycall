@@ -1,14 +1,11 @@
 # TODO — tcl-polycall
 
-Status: implemented Tcl 9 source adapter for libpolycall 1.5.
+Status: Tcl 9 extension over the Polycall binding ABI v1 (libpolycall >= 1.1.0).
 
-- [x] Exact thin shim over `polycall_ffi_run_config(config_path, 1)`
-- [x] Tcl 9 loadable-extension entry point and namespaced commands
-- [x] Raw-status and Tcl-error API variants
-- [x] Native mock contract test and Tcl extension smoke test
-- [x] npm package metadata, relative directory index, README, and MIT license
-- [x] Tcl 9.0.4 source-header compatibility check
-- [ ] Build the supplied `C:/ProgramData/tcl9.0.4` source tree
-- [ ] Run `make test-tcl` with its resulting `tclsh90` and stub library
-- [ ] Run an end-to-end test against a built libpolycall shared core
-- [ ] Publish `@obinexusltd/tcl-polycall` publicly on npm
+- [x] `src/tcl_polycall.c` includes the real `<polycall.h>`; linked via pkg-config
+- [x] `-fPIC`, `-z now`, RUNPATH; macOS builds `.dylib` (what `[info sharedlibextension]` loads)
+- [x] `run_config ?path?` keeps `polycall_ffi_run_config(path, 1)`; `call`; `peer ...`
+- [x] Errors: `-errorcode {POLYCALL NAME status detail ?extra?}`
+- [x] tcltest suite against the real core (Linux, Debian 13, Tcl 9.0.1 + Thread 3.0.1)
+- [ ] Windows build (MSVC/MinGW Tcl 9 with its stub library) and run
+- [ ] Publish `@obinexusltd/tcl-polycall`

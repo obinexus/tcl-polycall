@@ -5,12 +5,9 @@ const path = require('node:path');
 
 const relativeDirectories = Object.freeze({
   src: 'src',
-  include: 'include',
-  generated: 'generated',
   dist: 'dist',
   examples: 'examples',
-  tests: 'tests',
-  scripts: 'scripts'
+  tests: 'tests'
 });
 
 function walkFiles(root, current = root) {
@@ -64,6 +61,8 @@ module.exports = Object.freeze({
   directories,
   resolve,
   packageIndex: path.join(__dirname, 'pkgIndex.tcl'),
+  extensionSource: path.join(__dirname, 'src', 'tcl_polycall.c'),
+  loader: path.join(__dirname, 'src', 'polycall.tcl'),
   makefile: path.join(__dirname, 'Makefile'),
   config: path.join(__dirname, 'tcl-polycallrc'),
   manifest: path.join(__dirname, 'polycall-binding.json')

@@ -1,0 +1,15 @@
+# QA descriptor for the Polycall binding matrix (read by polycall/qa/run_qa.py).
+# This repository is NOT a Python package and is not pip-installable;
+# its native manifest is Makefile + pkgIndex.tcl (npm distribution: package.json).
+[tool.polycall.binding]
+name = "tcl-polycall"
+language = "Tcl"
+native_manifest = "Makefile"
+registry = "npm"
+package = "@obinexusltd/tcl-polycall"
+abi = 1
+support = "supported"
+linux_image = "debian:13 (tcl9.0-dev tcl9.0-thread make gcc pkg-config; core via build-linux-core.sh)"
+build = "make"
+test = "sh tests/run-real-core.sh"
+windows_test = ""
